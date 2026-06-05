@@ -1,0 +1,1 @@
+# jdk21_ubi9_gradle_hardened
