@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+
+ARG UBI_OPENJDK_RUNTIME_IMAGE=registry.access.redhat.com/ubi9/openjdk-21-runtime:1.24
+
+FROM ${UBI_OPENJDK_RUNTIME_IMAGE}
+
+LABEL org.opencontainers.image.title="UBI9 OpenJDK 21 hardened runtime image" \
+      org.opencontainers.image.description="Minimal runtime image for pre-built Java 21 applications" \
+      org.opencontainers.image.vendor="local" \
+      org.opencontainers.image.base.name="registry.access.redhat.com/ubi9/openjdk-21-runtime:1.24" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+USER 0
+WORKDIR /deployments
+
+COPY --chown=185:0 build/libs/app.jar /deployments/app.jar
+
+RUN chgrp -R 0 /deployments \
+ && chmod -R g=u /deployments \
+ && chmod 0444 /deployments/app.jar \
+ && rm -rf /tmp/* /var/tmp/*
+
+USER 185
+
+ENV JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+
+ENTRYPOINT ["java", "-jar", "/deployments/app.jar"]
