@@ -1,82 +1,100 @@
-# Hardened TeamCity Gradle 8.14.5 Build Container on UBI9 and JDK 21
+# TeamCity Hardened Build Container: UBI9 + JDK 21 + Gradle 8.14.5
 
 ## Purpose
 
-This document defines a hardened TeamCity build-step container for running Gradle `8.14.5` with JDK 21 on Red Hat UBI9.
+This document defines a hardened, non-privileged TeamCity build-step container for Java builds requiring:
 
-The target use case is a **TeamCity Gradle build step**, not a production runtime image.
+- Red Hat UBI9
+- JDK 21
+- Gradle 8.14.5
+- Minimal build-image posture
+- No privileged container mode
+- No Docker socket mount
+- No production/runtime image contents unless explicitly required
 
-The recommended design is:
+This is a **TeamCity CI build image** process, not a production runtime image process.
 
-```text
-TeamCity Gradle runner
-+ Gradle Wrapper pinned to Gradle 8.14.5
-+ UBI9 OpenJDK 21 builder image
-+ non-root execution
-+ pinned checksums
-+ restricted Docker/Podman runtime flags
-+ controlled dependency access
+---
+
+## Correct Interpretation
+
+There are two valid TeamCity approaches:
+
+| Approach | Gradle installed in image | Recommended | Security posture |
+|---|---:|---:|---|
+| Gradle Wrapper | No | Yes | Strongest |
+| Installed Gradle 8.14.5 | Yes | Only if wrapper is not allowed | Acceptable if pinned and checksum-verified |
+
+The Gradle Wrapper approach is better because the image only needs JDK 21. Gradle version control stays in the repository through `gradle-wrapper.properties`.
+
+The installed-Gradle approach is only needed when TeamCity must call `/opt/gradle/bin/gradle` directly or organizational policy forbids wrapper execution.
+
+---
+
+## Non-Privileged Requirement
+
+The TeamCity container must **not** run privileged.
+
+Do not use:
+
+```bash
+--privileged
 ```
 
-## Decision Summary
+Do not mount the host Docker socket:
 
-Use a hardened CI/build image only.
-
-Do not deploy this image to production.
-
-Do not include Gradle in runtime application images.
-
-| Requirement | Decision |
-|---|---|
-| Operating system base | Red Hat UBI9 |
-| Java version | JDK 21 |
-| Build tool | Gradle 8.14.5 |
-| Preferred Gradle source | Project Gradle Wrapper |
-| Fallback Gradle source | Installed `/opt/gradle` inside image |
-| Runtime user | Non-root user `185` |
-| Writable paths | `/tmp`, Gradle user home, TeamCity checkout/build dirs |
-| Privileges | Drop Linux capabilities, no privilege escalation |
-| Network posture | Prefer internal artifact proxy; offline builds after cache/mirror warmup |
-| Production image | Separate runtime image without Gradle |
-
-## Why the Runtime Image Is Not Needed
-
-For TeamCity builds, use the Red Hat UBI9 OpenJDK 21 builder image.
-
-Red Hat marks `registry.access.redhat.com/ubi9/openjdk-21` as the OpenJDK 21 builder image. It is intended for building and running Java 21 applications.
-
-Do not use `registry.access.redhat.com/ubi9/openjdk-21-runtime` for this TeamCity build image. Red Hat describes it as a lean runtime-only image that does not contain the Java compiler, JDK tools, or Maven. It is appropriate only after the build is complete.
-
-## Preferred Pattern: Use Gradle Wrapper
-
-This is the recommended configuration.
-
-The container only supplies:
-
-```text
-UBI9
-JDK 21
-CA certificates
-non-root execution
-writable temporary directories
+```bash
+-v /var/run/docker.sock:/var/run/docker.sock
 ```
 
-Gradle itself is supplied by the repository through `gradlew`.
+Do not mount host home directories:
+
+```bash
+-v /home:/home
+-v ~/.gradle:/home/user/.gradle
+```
+
+Do not run as root:
+
+```bash
+--user 0
+```
+
+Required hardened runtime flags:
+
+```bash
+--user 185:0 \
+--cap-drop=ALL \
+--security-opt=no-new-privileges \
+--pids-limit=512 \
+--memory=4g \
+--cpus=2 \
+--tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g
+```
+
+Use `--read-only` only when TeamCity checkout, temp, Gradle cache, and report directories are mounted as writable volumes.
+
+---
+
+## Preferred Option: Wrapper-Only TeamCity Image
+
+Use this when the repository contains:
+
+```text
+gradlew
+gradlew.bat
+gradle/wrapper/gradle-wrapper.jar
+gradle/wrapper/gradle-wrapper.properties
+```
 
 ### `gradle/wrapper/gradle-wrapper.properties`
 
-Set the Gradle Wrapper to Gradle `8.14.5` and pin the distribution checksum.
-
 ```properties
- distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.5-bin.zip
- distributionSha256Sum=6f74b601422d6d6fc4e1f9a1ab6522f642c2fdcbc15ae33ebd30ba3d7198e854
+distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.5-bin.zip
+distributionSha256Sum=6f74b601422d6d6fc4e1f9a1ab6522f642c2fdcbc15ae33ebd30ba3d7198e854
 ```
 
-The SHA-256 value above is the official checksum for `gradle-8.14.5-bin.zip` from Gradle's checksum reference.
-
-### Minimal Hardened Dockerfile for Wrapper Mode
-
-Use this image when TeamCity is configured with **Use Gradle Wrapper** enabled.
+### `Dockerfile.teamcity-wrapper`
 
 ```dockerfile
 FROM registry.access.redhat.com/ubi9/openjdk-21:1.24
@@ -98,31 +116,38 @@ USER 185
 CMD ["java", "-version"]
 ```
 
-### Build the Wrapper-Mode Image
+### Build
 
 ```bash
 podman build \
   --pull=always \
-  -t registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0 \
-  -f Dockerfile .
+  -f Dockerfile.teamcity-wrapper \
+  -t ubi9-jdk21-teamcity-wrapper:latest .
 ```
 
-Equivalent Docker command:
+### Hardened local test
 
 ```bash
-docker build \
-  --pull \
-  -t registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0 \
-  -f Dockerfile .
+podman run --rm \
+  --user 185:0 \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --pids-limit=512 \
+  --memory=4g \
+  --cpus=2 \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g \
+  -v "$PWD":/workspace:Z \
+  ubi9-jdk21-teamcity-wrapper:latest \
+  ./gradlew --version
 ```
 
-## Fallback Pattern: Install Gradle 8.14.5 in the Image
+---
 
-Use this only when TeamCity cannot use `gradlew` or when policy requires a centrally managed Gradle binary.
+## Fallback Option: Installed Gradle 8.14.5 Image
 
-This image installs Gradle into `/opt/gradle`, verifies the official SHA-256 checksum, and does not copy `curl`, `unzip`, or package-manager artifacts into the final image.
+Use this only when TeamCity is configured to use installed Gradle instead of the wrapper.
 
-### Hardened Dockerfile with Installed Gradle
+### `Dockerfile.teamcity-gradle`
 
 ```dockerfile
 # syntax=docker/dockerfile:1.7
@@ -180,83 +205,93 @@ USER 185
 CMD ["gradle", "--version"]
 ```
 
-### Build the Installed-Gradle Image
+### Build
 
 ```bash
 podman build \
   --pull=always \
-  --build-arg GRADLE_VERSION=8.14.5 \
-  --build-arg GRADLE_SHA256=6f74b601422d6d6fc4e1f9a1ab6522f642c2fdcbc15ae33ebd30ba3d7198e854 \
-  -t registry.example.com/ci/ubi9-jdk21-gradle8-teamcity:8.14.5 \
-  -f Dockerfile .
+  -f Dockerfile.teamcity-gradle \
+  -t ubi9-jdk21-gradle8145-teamcity:latest .
 ```
 
-Equivalent Docker command:
+### Hardened local test
 
 ```bash
-docker build \
-  --pull \
-  --build-arg GRADLE_VERSION=8.14.5 \
-  --build-arg GRADLE_SHA256=6f74b601422d6d6fc4e1f9a1ab6522f642c2fdcbc15ae33ebd30ba3d7198e854 \
-  -t registry.example.com/ci/ubi9-jdk21-gradle8-teamcity:8.14.5 \
-  -f Dockerfile .
+podman run --rm \
+  --user 185:0 \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --pids-limit=512 \
+  --memory=4g \
+  --cpus=2 \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g \
+  -v "$PWD":/workspace:Z \
+  ubi9-jdk21-gradle8145-teamcity:latest \
+  gradle --version
 ```
 
-## TeamCity Configuration
+---
 
-### Preferred TeamCity Gradle Step
+## TeamCity Configuration: Wrapper Mode
 
-Use this when the repository contains `gradlew`.
+Use this configuration when using the preferred wrapper-only image.
 
 ```text
 Runner type: Gradle
 Use Gradle wrapper: enabled
 Tasks: clean build
-Docker image: registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0
+Docker image: your-registry/ubi9-jdk21-teamcity-wrapper:latest
 ```
 
-### Fallback TeamCity Gradle Step
+Additional Docker run parameters:
 
-Use this only when Gradle is installed in the image.
+```bash
+--user 185:0
+--cap-drop=ALL
+--security-opt=no-new-privileges
+--pids-limit=512
+--memory=4g
+--cpus=2
+--tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g
+```
+
+Do not add `--privileged`.
+
+Do not mount `/var/run/docker.sock`.
+
+---
+
+## TeamCity Configuration: Installed Gradle Mode
+
+Use this only for the fallback installed-Gradle image.
 
 ```text
 Runner type: Gradle
 Use Gradle wrapper: disabled
 Gradle home: /opt/gradle
 Tasks: clean build
-Docker image: registry.example.com/ci/ubi9-jdk21-gradle8-teamcity:8.14.5
+Docker image: your-registry/ubi9-jdk21-gradle8145-teamcity:latest
 ```
 
-## Hardened Docker/Podman Runtime Arguments
-
-Use these as TeamCity additional Docker/Podman run arguments where supported.
+Additional Docker run parameters:
 
 ```bash
---user 185:0 \
---cap-drop=ALL \
---security-opt=no-new-privileges \
---pids-limit=512 \
---memory=4g \
---cpus=2 \
+--user 185:0
+--cap-drop=ALL
+--security-opt=no-new-privileges
+--pids-limit=512
+--memory=4g
+--cpus=2
 --tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g
 ```
 
-Use `--read-only` only after validating that TeamCity mounts all required working directories as writable.
+Do not add `--privileged`.
 
-Gradle and TeamCity need writable locations for:
+Do not mount `/var/run/docker.sock`.
 
-```text
-checkout directory
-build directory
-Gradle user home
-Gradle dependency cache
-test reports
-temporary files
-```
+---
 
-A safer first pass is to keep the image filesystem immutable by design but avoid `--read-only` until the build has been tested.
-
-## TeamCity Kotlin DSL Example: Wrapper Mode
+## TeamCity Kotlin DSL: Wrapper Mode
 
 ```kotlin
 gradle {
@@ -265,8 +300,7 @@ gradle {
 
     useGradleWrapper = true
 
-    dockerImage = "registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0"
-    dockerImagePlatform = GradleBuildStep.ImagePlatform.Linux
+    dockerImage = "your-registry/ubi9-jdk21-teamcity-wrapper:latest"
     dockerRunParameters = """
         --user 185:0
         --cap-drop=ALL
@@ -279,7 +313,9 @@ gradle {
 }
 ```
 
-## TeamCity Kotlin DSL Example: Installed Gradle Mode
+---
+
+## TeamCity Kotlin DSL: Installed Gradle Mode
 
 ```kotlin
 gradle {
@@ -289,8 +325,7 @@ gradle {
     useGradleWrapper = false
     gradleHome = "/opt/gradle"
 
-    dockerImage = "registry.example.com/ci/ubi9-jdk21-gradle8-teamcity:8.14.5"
-    dockerImagePlatform = GradleBuildStep.ImagePlatform.Linux
+    dockerImage = "your-registry/ubi9-jdk21-gradle8145-teamcity:latest"
     dockerRunParameters = """
         --user 185:0
         --cap-drop=ALL
@@ -303,200 +338,100 @@ gradle {
 }
 ```
 
-## Dependency and Network Controls
+---
 
-Do not allow unrestricted dependency downloads from the public internet in hardened CI.
+## Corrected Security Controls Checklist
 
-Recommended posture:
+| Control | Wrapper-only image | Installed-Gradle image |
+|---|---:|---:|
+| Use UBI9 OpenJDK 21 builder image | Yes | Yes |
+| Install Gradle into image | No | Yes |
+| Pin Gradle 8.14.5 | In wrapper properties | In Dockerfile |
+| Verify Gradle SHA-256 | `distributionSha256Sum` | `sha256sum -c` |
+| Run container as non-root | Yes | Yes |
+| Run container with `--privileged` | No | No |
+| Mount host Docker socket | No | No |
+| Add Linux capabilities | No | No |
+| Drop all capabilities | Yes | Yes |
+| Disable privilege escalation | Yes | Yes |
+| Mount host home directories | No | No |
+| Use internal artifact proxy | Yes | Yes |
+| Avoid public internet during CI build | Yes | Yes |
+| Scan image before publishing | Yes | Yes |
+| Pull patched UBI base during rebuild | Yes | Yes |
+| Separate CI build image from runtime image | Yes | Yes, if an app runtime image is also built |
 
-```text
-Use an internal Maven/Gradle artifact proxy.
-Allow outbound network only to the internal proxy.
-Pin plugin repositories.
-Use Gradle dependency locking.
-Use checksum verification.
-Run offline where possible after dependency resolution is controlled.
+---
+
+## Read-Only Filesystem Guidance
+
+Do not start with `--read-only` in TeamCity unless all writable paths are explicitly handled.
+
+Gradle and TeamCity may need writable locations for:
+
+- checkout directory
+- build output
+- test reports
+- Gradle user home
+- temporary directory
+- TeamCity agent temp files
+
+Safer baseline:
+
+```bash
+--tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g
 ```
 
-Example Gradle command after dependencies are available through a controlled proxy:
+Stricter mode after validation:
+
+```bash
+--read-only \
+--tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g
+```
+
+Only enable `--read-only` after confirming the checkout and cache directories are mounted writable by TeamCity.
+
+---
+
+## Dependency and Network Controls
+
+Preferred CI dependency flow:
+
+1. Resolve dependencies through an internal artifact proxy.
+2. Pin plugin repositories.
+3. Pin Gradle version.
+4. Verify Gradle distribution checksum.
+5. Avoid public internet during regular CI builds.
+6. Use `--offline` where feasible after dependency cache/proxy validation.
+
+Example Gradle invocation:
 
 ```bash
 ./gradlew --offline clean build
 ```
 
-## Gradle User Home
-
-Set Gradle user home explicitly.
+Installed Gradle equivalent:
 
 ```bash
-GRADLE_USER_HOME=/tmp/gradle-user-home
+gradle --offline clean build
 ```
 
-For TeamCity, prefer a controlled cache mount if builds need dependency reuse.
+---
 
-Example Docker/Podman volume:
+## Final Decision
 
-```bash
--v teamcity-gradle-cache:/tmp/gradle-user-home:Z
-```
+Use the wrapper-only image unless there is a hard requirement to install Gradle in the TeamCity image.
 
-Do not mount host-wide user directories into the build container.
-
-## Recommended Repository Files
-
-For wrapper mode:
+The strictest TeamCity posture is:
 
 ```text
-Dockerfile
-.dockerignore
-README.md
-gradle/wrapper/gradle-wrapper.properties
-gradle/wrapper/gradle-wrapper.jar
-gradlew
-gradlew.bat
+UBI9 OpenJDK 21 image
++ Gradle Wrapper pinned to 8.14.5
++ distributionSha256Sum set
++ non-root UID 185
++ no privileged mode
++ no Docker socket
++ dropped capabilities
++ no privilege escalation
++ internal artifact proxy
 ```
-
-For installed-Gradle mode:
-
-```text
-Dockerfile
-.dockerignore
-README.md
-checksums/gradle-8.14.5-bin.zip.sha256
-```
-
-## `.dockerignore`
-
-Use a restrictive `.dockerignore`.
-
-```dockerignore
-.git
-.github
-.gradle
-build
-out
-.idea
-*.iml
-*.log
-*.tmp
-.DS_Store
-node_modules
-```
-
-## Verification Commands
-
-### Check Java
-
-```bash
-podman run --rm registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0 java -version
-```
-
-### Check Gradle Wrapper
-
-```bash
-podman run --rm \
-  -v "$PWD":/workspace:Z \
-  -w /workspace \
-  registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0 \
-  ./gradlew --version
-```
-
-### Check Installed Gradle
-
-```bash
-podman run --rm registry.example.com/ci/ubi9-jdk21-gradle8-teamcity:8.14.5 gradle --version
-```
-
-### Check Effective User
-
-```bash
-podman run --rm registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0 id
-```
-
-Expected result should show user `185`.
-
-## Security Controls Checklist
-
-| Control | Required |
-|---|---|
-| Pin base image tag | Yes |
-| Pull latest patched base during rebuild | Yes |
-| Run as non-root | Yes |
-| Drop all capabilities | Yes |
-| Disable privilege escalation | Yes |
-| Verify Gradle checksum | Yes |
-| Prefer Gradle Wrapper checksum | Yes |
-| Use internal artifact proxy | Yes |
-| Avoid public internet during CI build | Yes |
-| Avoid privileged Docker mode | Yes |
-| Avoid mounting host home directories | Yes |
-| Separate build and runtime images | Yes |
-| Scan image before publishing | Yes |
-| Rebuild regularly for UBI patches | Yes |
-
-## Image Scanning
-
-Run at least one scanner before publishing.
-
-Example with Trivy:
-
-```bash
-trivy image --severity HIGH,CRITICAL registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0
-```
-
-Example with Grype:
-
-```bash
-grype registry.example.com/ci/ubi9-jdk21-teamcity:1.0.0
-```
-
-A hardened container is still dependent on timely rebuilds and patched base images.
-
-## Maintenance Policy
-
-Rebuild the image when any of the following changes:
-
-```text
-Red Hat UBI9/OpenJDK image update
-Gradle security release
-JDK security update
-TeamCity agent/container-wrapper behavior change
-internal dependency proxy certificate change
-scanner reports new high or critical findings
-```
-
-Minimum rebuild cadence:
-
-```text
-monthly
-or immediately after high/critical CVE disclosure
-```
-
-## Final Recommended Implementation
-
-Use wrapper mode unless there is a strict policy reason not to.
-
-Final target state:
-
-```text
-TeamCity Gradle runner
-Use Gradle Wrapper = true
-Gradle Wrapper pinned to 8.14.5
-Gradle Wrapper SHA-256 enabled
-Container image = UBI9 OpenJDK 21 only
-Run as non-root user 185
-Drop all Linux capabilities
-Disable privilege escalation
-Restrict network to internal artifact proxy
-Separate CI image from runtime image
-```
-
-## References
-
-- Red Hat UBI9 OpenJDK 21 builder image: https://catalog.redhat.com/en/software/containers/ubi9/openjdk-21/6501cdb5c34ae048c44f7814
-- Red Hat UBI9 OpenJDK 21 runtime image: https://catalog.redhat.com/en/software/containers/ubi9/openjdk-21-runtime/6501ce769a0d86945c422d5f
-- Gradle checksum reference: https://gradle.org/release-checksums/
-- TeamCity Gradle build runner: https://www.jetbrains.com/help/teamcity/gradle.html
-- TeamCity Run in Docker: https://www.jetbrains.com/help/teamcity/run-in-docker.html
-- TeamCity Container Wrapper: https://www.jetbrains.com/help/teamcity/container-wrapper.html
-- TeamCity Gradle Kotlin DSL: https://teamcity.jetbrains.com/app/dsl-documentation/buildSteps/gradle-build-step/index.html
