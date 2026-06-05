@@ -1,0 +1,17 @@
+FROM registry.access.redhat.com/ubi9/openjdk-21:1.24
+
+USER 0
+
+ENV GRADLE_USER_HOME=/tmp/gradle-user-home \
+    JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+
+RUN mkdir -p /workspace /tmp/gradle-user-home \
+ && chgrp -R 0 /workspace /tmp/gradle-user-home \
+ && chmod -R g=u /workspace /tmp/gradle-user-home \
+ && rm -rf /tmp/* /var/tmp/*
+
+WORKDIR /workspace
+
+USER 185
+
+CMD ["java", "-version"]
